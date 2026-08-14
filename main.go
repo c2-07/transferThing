@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"encoding/gob"
 	"flag"
@@ -20,8 +21,9 @@ const (
 )
 
 type FileMetadata struct {
-	Name string
-	Size int64
+	Name  string
+	Size  int64
+	IsDir bool
 }
 
 func discoverReceiver(port int) *net.UDPAddr {
@@ -95,20 +97,29 @@ func sendFile(path, ip string, port int) {
 
 	log.Info("connected to receiver", "ip", receiver.IP)
 
+	info, err := os.Stat(path)
+	if err != nil {
+		log.Fatal("stat", "err", err)
+	}
+
+	if info.IsDir() {
+		sendFolder(conn, path, info)
+	} else {
+		sendSingleFile(conn, path, info)
+	}
+}
+
+func sendSingleFile(conn net.Conn, path string, info os.FileInfo) {
 	file, err := os.Open(path)
 	if err != nil {
 		log.Fatal("open", "err", err)
 	}
 	defer file.Close()
 
-	info, err := file.Stat()
-	if err != nil {
-		log.Fatal("stat", "err", err)
-	}
-
 	err = gob.NewEncoder(conn).Encode(FileMetadata{
-		Name: info.Name(),
-		Size: info.Size(),
+		Name:  info.Name(),
+		Size:  info.Size(),
+		IsDir: false,
 	})
 	if err != nil {
 		log.Fatal("metadata", "err", err)
@@ -126,6 +137,95 @@ func sendFile(path, ip string, port int) {
 
 	log.Info("file sent", "name", info.Name())
 }
+
+// dirSize returns the total size of all files under root.
+func dirSize(root string) (int64, error) {
+	var total int64
+	err := filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total, err
+}
+
+// zipDir walks srcDir and writes a zip archive into w.
+func zipDir(w io.Writer, srcDir string) error {
+	zw := zip.NewWriter(w)
+
+	base := filepath.Dir(srcDir) // preserve top-level folder name inside zip
+
+	err := filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Build the relative path inside the zip.
+		rel, err := filepath.Rel(base, path)
+		if err != nil {
+			return err
+		}
+		// Use forward slashes in the zip regardless of OS.
+		rel = filepath.ToSlash(rel)
+
+		if info.IsDir() {
+			// Ensure directory entries end with "/".
+			_, err = zw.Create(rel + "/")
+			return err
+		}
+
+		fw, err := zw.Create(rel)
+		if err != nil {
+			return err
+		}
+
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		_, err = io.Copy(fw, f)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+
+	return zw.Close()
+}
+
+func sendFolder(conn net.Conn, path string, info os.FileInfo) {
+	approxSize, err := dirSize(path)
+	if err != nil {
+		log.Fatal("dirsize", "err", err)
+	}
+
+	// Send metadata. We don't know the compressed size up-front, so use the
+	// uncompressed total as an approximation for the progress bar.
+	err = gob.NewEncoder(conn).Encode(FileMetadata{
+		Name:  info.Name(),
+		Size:  approxSize,
+		IsDir: true,
+	})
+	if err != nil {
+		log.Fatal("metadata", "err", err)
+	}
+
+	bar := progressbar.DefaultBytes(approxSize, "sending")
+
+	// Zip the directory directly into the TCP connection, tee-ing through bar.
+	if err := zipDir(io.MultiWriter(conn, bar), path); err != nil {
+		log.Fatal("zip", "err", err)
+	}
+
+	log.Info("folder sent", "name", info.Name())
+}
+
 
 func receiveFile(output, ip string, port int) {
 	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{
@@ -166,8 +266,16 @@ func receiveFile(output, ip string, port int) {
 		log.Fatal("metadata", "err", err)
 	}
 
-	log.Info("incoming file", "name", metadata.Name, "size", metadata.Size)
+	log.Info("incoming", "name", metadata.Name, "size", metadata.Size, "isDir", metadata.IsDir)
 
+	if metadata.IsDir {
+		receiveFolder(bufReader, output, metadata)
+	} else {
+		receiveSingleFile(bufReader, output, metadata)
+	}
+}
+
+func receiveSingleFile(r io.Reader, output string, metadata FileMetadata) {
 	// If no output filename was supplied, use the original filename.
 	if output == "" {
 		output = metadata.Name
@@ -179,12 +287,9 @@ func receiveFile(output, ip string, port int) {
 	}
 	defer file.Close()
 
-	bar := progressbar.DefaultBytes(
-		metadata.Size,
-		"receiving",
-	)
+	bar := progressbar.DefaultBytes(metadata.Size, "receiving")
 
-	_, err = io.CopyN(io.MultiWriter(file, bar), bufReader, metadata.Size)
+	_, err = io.CopyN(io.MultiWriter(file, bar), r, metadata.Size)
 	if err != nil {
 		log.Fatal("transfer", "err", err)
 	}
@@ -192,16 +297,85 @@ func receiveFile(output, ip string, port int) {
 	log.Info("file received", "name", output)
 }
 
+func receiveFolder(r io.Reader, output string, metadata FileMetadata) {
+	if output == "" {
+		output = metadata.Name
+	}
+
+	bar := progressbar.DefaultBytes(metadata.Size, "receiving")
+
+	// Buffer all zip data into a temp file so zip.NewReader can seek.
+	tmp, err := os.CreateTemp("", "transferthing-*.zip")
+	if err != nil {
+		log.Fatal("tempfile", "err", err)
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+
+	_, err = io.Copy(io.MultiWriter(tmp, bar), r)
+	if err != nil {
+		log.Fatal("transfer", "err", err)
+	}
+
+	size, err := tmp.Seek(0, io.SeekCurrent)
+	if err != nil {
+		log.Fatal("seek", "err", err)
+	}
+
+	zr, err := zip.NewReader(tmp, size)
+	if err != nil {
+		log.Fatal("unzip", "err", err)
+	}
+
+	for _, f := range zr.File {
+		destPath := filepath.Join(output, filepath.FromSlash(f.Name))
+
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(destPath, 0755); err != nil {
+				log.Fatal("mkdir", "err", err)
+			}
+			continue
+		}
+
+		// Ensure parent dirs exist.
+		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+			log.Fatal("mkdir", "err", err)
+		}
+
+		out, err := os.Create(destPath)
+		if err != nil {
+			log.Fatal("create", "err", err)
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			out.Close()
+			log.Fatal("zip open", "err", err)
+		}
+
+		if _, err := io.Copy(out, rc); err != nil {
+			rc.Close()
+			out.Close()
+			log.Fatal("extract", "err", err)
+		}
+
+		rc.Close()
+		out.Close()
+	}
+
+	log.Info("folder received", "name", output)
+}
+
 func printUsage() {
 	fmt.Println(`transferthing - A simple file transfer tool
 
 Usage:
   transferthing <command> [arguments]
-  transferthing <filename> [arguments]  (shortcut for send)
+  transferthing <path> [arguments]  (shortcut for send)
 
 Commands:
-  send    Send a file
-  recv    Receive a file
+  send    Send a file or folder
+  recv    Receive a file or folder
 
 Run 'transferthing <command> -h' for more details.`)
 }
@@ -229,7 +403,7 @@ func main() {
 		args := send.Args()
 
 		if len(args) != 1 {
-			log.Fatal("usage: transferthing send <file> [-ip IP] [-port PORT]")
+			log.Fatal("usage: transferthing send <file|folder> [-ip IP] [-port PORT]")
 		}
 
 		file := args[0]
@@ -247,7 +421,7 @@ func main() {
 		file := recv.String(
 			"file",
 			"",
-			"output filename",
+			"output filename or folder name",
 		)
 
 		ip := recv.String(
@@ -267,9 +441,9 @@ func main() {
 		receiveFile(*file, *ip, *port)
 
 	default:
-		// Check if it's a file, if so, assume "send"
-		info, err := os.Stat(os.Args[1])
-		if err == nil && !info.IsDir() {
+		// Check if it's a file or folder, if so, assume "send"
+		_, err := os.Stat(os.Args[1])
+		if err == nil {
 			send := flag.NewFlagSet("send", flag.ExitOnError)
 			ip := send.String("ip", "", "receiver IP")
 			port := send.Int("port", DefaultPort, "receiver port")
@@ -289,3 +463,4 @@ func main() {
 		printUsage()
 	}
 }
+
