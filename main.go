@@ -1,14 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"encoding/gob"
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
+
+	"github.com/charmbracelet/log"
+	"github.com/schollz/progressbar/v3"
 )
 
 const (
@@ -31,40 +34,40 @@ func discoverReceiver(port int) *net.UDPAddr {
 	}
 	defer conn.Close()
 
-	fmt.Println("waiting for receiver...")
+	log.Info("waiting for receiver...")
 
 	buf := make([]byte, 1024)
 
 	for {
 		n, addr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Fatal("discovery:", err)
+			log.Fatal("discovery", "err", err)
 		}
 
 		if string(buf[:n]) != ServicePhrase {
 			continue
 		}
 
-		fmt.Println("receiver discovered:", addr.IP)
+		log.Info("receiver discovered", "ip", addr.IP)
 		return addr
 	}
 }
 
-func announceReceiver(port int) {
+func announceReceiver(targetIP net.IP, port int) {
 	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{
-		IP:   net.IPv4bcast,
+		IP:   targetIP,
 		Port: port,
 	})
 	if err != nil {
-		log.Fatal("discovery:", err)
+		log.Fatal("discovery", "err", err)
 	}
 	defer conn.Close()
 
 	if _, err := conn.Write([]byte(ServicePhrase)); err != nil {
-		log.Fatal("discovery:", err)
+		log.Fatal("discovery", "err", err)
 	}
 
-	fmt.Println("discovery broadcast sent")
+	log.Info("discovery packet sent", "target", targetIP)
 }
 
 func sendFile(path, ip string, port int) {
@@ -81,26 +84,26 @@ func sendFile(path, ip string, port int) {
 		}
 	}
 
-	conn, err := net.DialTCP("tcp4", &net.TCPAddr{
+	conn, err := net.DialTCP("tcp4", nil, &net.TCPAddr{
 		IP:   receiver.IP,
-		Port: receiver.Port,
-	}, nil)
+		Port: port,
+	})
 	if err != nil {
-		log.Fatal("connect:", err)
+		log.Fatal("connect", "err", err)
 	}
 	defer conn.Close()
 
-	fmt.Println("connected to receiver:", receiver.IP)
+	log.Info("connected to receiver", "ip", receiver.IP)
 
 	file, err := os.Open(path)
 	if err != nil {
-		log.Fatal("open:", err)
+		log.Fatal("open", "err", err)
 	}
 	defer file.Close()
 
 	info, err := file.Stat()
 	if err != nil {
-		log.Fatal("stat:", err)
+		log.Fatal("stat", "err", err)
 	}
 
 	err = gob.NewEncoder(conn).Encode(FileMetadata{
@@ -108,49 +111,62 @@ func sendFile(path, ip string, port int) {
 		Size: info.Size(),
 	})
 	if err != nil {
-		log.Fatal("metadata:", err)
+		log.Fatal("metadata", "err", err)
 	}
 
-	_, err = io.Copy(conn, file)
+	bar := progressbar.DefaultBytes(
+		info.Size(),
+		"sending",
+	)
+
+	_, err = io.Copy(io.MultiWriter(conn, bar), file)
 	if err != nil {
-		log.Fatal("transfer:", err)
+		log.Fatal("transfer", "err", err)
 	}
 
-	fmt.Println("file sent:", info.Name())
+	log.Info("file sent", "name", info.Name())
 }
 
-func receiveFile(output string, port int) {
+func receiveFile(output, ip string, port int) {
 	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{
 		IP:   net.IPv4zero,
 		Port: port,
 	})
 	if err != nil {
-		log.Fatal("listen:", err)
+		log.Fatal("listen", "err", err)
 	}
 	defer listener.Close()
 
-	// Start listening BEFORE announcing ourselves.
-	announceReceiver(port)
+	targetIP := net.IPv4bcast
+	if ip != "" {
+		targetIP = net.ParseIP(ip)
+	}
 
-	fmt.Println("waiting for sender...")
+	// Start listening BEFORE announcing ourselves.
+	announceReceiver(targetIP, port)
+
+	log.Info("waiting for sender...")
 
 	conn, err := listener.AcceptTCP()
 	if err != nil {
-		log.Fatal("accept:", err)
+		log.Fatal("accept", "err", err)
 	}
 	defer conn.Close()
 
-	fmt.Println("sender connected:", conn.RemoteAddr())
+	log.Info("sender connected", "addr", conn.RemoteAddr())
 
 	var metadata FileMetadata
 
-	err = gob.NewDecoder(conn).Decode(&metadata)
+	// gob internally buffers reads from the connection, which can consume
+	// bytes belonging to the file payload. We must share a single bufio.Reader
+	// between the decoder and the subsequent file copy so those bytes aren't lost.
+	bufReader := bufio.NewReader(conn)
+	err = gob.NewDecoder(bufReader).Decode(&metadata)
 	if err != nil {
-		log.Fatal("metadata:", err)
+		log.Fatal("metadata", "err", err)
 	}
 
-	fmt.Println("file:", metadata.Name)
-	fmt.Println("size:", metadata.Size)
+	log.Info("incoming file", "name", metadata.Name, "size", metadata.Size)
 
 	// If no output filename was supplied, use the original filename.
 	if output == "" {
@@ -159,25 +175,48 @@ func receiveFile(output string, port int) {
 
 	file, err := os.Create(output)
 	if err != nil {
-		log.Fatal("create:", err)
+		log.Fatal("create", "err", err)
 	}
 	defer file.Close()
 
-	_, err = io.CopyN(file, conn, metadata.Size)
+	bar := progressbar.DefaultBytes(
+		metadata.Size,
+		"receiving",
+	)
+
+	_, err = io.CopyN(io.MultiWriter(file, bar), bufReader, metadata.Size)
 	if err != nil {
-		log.Fatal("transfer:", err)
+		log.Fatal("transfer", "err", err)
 	}
 
-	fmt.Println("file received:", output)
+	log.Info("file received", "name", output)
+}
+
+func printUsage() {
+	fmt.Println(`transferthing - A simple file transfer tool
+
+Usage:
+  transferthing <command> [arguments]
+  transferthing <filename> [arguments]  (shortcut for send)
+
+Commands:
+  send    Send a file
+  recv    Receive a file
+
+Run 'transferthing <command> -h' for more details.`)
 }
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: transferthing <send|recv>")
+		printUsage()
 		return
 	}
 
 	switch os.Args[1] {
+
+	case "help", "-h", "--help":
+		printUsage()
+		return
 
 	case "send":
 		send := flag.NewFlagSet("send", flag.ExitOnError)
@@ -197,7 +236,7 @@ func main() {
 
 		path, err := filepath.Abs(file)
 		if err != nil {
-			log.Fatal("path:", err)
+			log.Fatal("path", "err", err)
 		}
 
 		sendFile(path, *ip, *port)
@@ -211,6 +250,12 @@ func main() {
 			"output filename",
 		)
 
+		ip := recv.String(
+			"ip",
+			"",
+			"sender IP to discover (instead of UDP broadcast)",
+		)
+
 		port := recv.Int(
 			"port",
 			DefaultPort,
@@ -219,9 +264,28 @@ func main() {
 
 		recv.Parse(os.Args[2:])
 
-		receiveFile(*file, *port)
+		receiveFile(*file, *ip, *port)
 
 	default:
-		fmt.Println("unknown command:", os.Args[1])
+		// Check if it's a file, if so, assume "send"
+		info, err := os.Stat(os.Args[1])
+		if err == nil && !info.IsDir() {
+			send := flag.NewFlagSet("send", flag.ExitOnError)
+			ip := send.String("ip", "", "receiver IP")
+			port := send.Int("port", DefaultPort, "receiver port")
+
+			send.Parse(os.Args[2:])
+
+			path, err := filepath.Abs(os.Args[1])
+			if err != nil {
+				log.Fatal("path", "err", err)
+			}
+
+			sendFile(path, *ip, *port)
+			return
+		}
+
+		log.Error("unknown command", "command", os.Args[1])
+		printUsage()
 	}
 }

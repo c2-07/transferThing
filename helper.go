@@ -1,8 +1,8 @@
 package main
 
 import (
-	"net"
 	"fmt"
+	"net"
 )
 
 func getLocalIP() (net.IP, error) {
