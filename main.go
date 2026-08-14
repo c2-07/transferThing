@@ -1,11 +1,14 @@
 package main
 
 import (
+	"encoding/gob"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 )
 
 const (
@@ -13,15 +16,18 @@ const (
 	ServicePhrase = "TRANSFERTHING_DISCOVERY"
 )
 
-// waitForReceiver waits for a discovery broadcast from a receiver
-// and returns the receiver's UDP address.
-func waitForReceiver() *net.UDPAddr {
+type FileMetadata struct {
+	Name string
+	Size int64
+}
+
+func discoverReceiver(port int) *net.UDPAddr {
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{
 		IP:   net.IPv4zero,
-		Port: DefaultPort,
+		Port: port,
 	})
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("discovery:", err)
 	}
 	defer conn.Close()
 
@@ -39,19 +45,18 @@ func waitForReceiver() *net.UDPAddr {
 			continue
 		}
 
-		fmt.Println("receiver discovered:", addr)
+		fmt.Println("receiver discovered:", addr.IP)
 		return addr
 	}
 }
 
-// broadcastDiscovery announces that this machine is ready to receive a file.
-func broadcastDiscovery() {
+func announceReceiver(port int) {
 	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{
 		IP:   net.IPv4bcast,
-		Port: DefaultPort,
+		Port: port,
 	})
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("discovery:", err)
 	}
 	defer conn.Close()
 
@@ -62,44 +67,108 @@ func broadcastDiscovery() {
 	fmt.Println("discovery broadcast sent")
 }
 
-// sendFile discovers the receiver and establishes a TCP connection to it.
-func sendFile() {
-	receiverAddr := waitForReceiver()
+func sendFile(path, ip string, port int) {
+	var receiver *net.UDPAddr
+
+	if ip == "" {
+		// No IP supplied → discover receiver using UDP broadcast.
+		receiver = discoverReceiver(port)
+	} else {
+		// IP supplied → skip discovery.
+		receiver = &net.UDPAddr{
+			IP:   net.ParseIP(ip),
+			Port: port,
+		}
+	}
 
 	conn, err := net.DialTCP("tcp4", &net.TCPAddr{
-		IP:   receiverAddr.IP,
-		Port: DefaultPort,
+		IP:   receiver.IP,
+		Port: receiver.Port,
 	}, nil)
 	if err != nil {
-		log.Fatal("send:", err)
+		log.Fatal("connect:", err)
 	}
 	defer conn.Close()
 
-	fmt.Println("connected to receiver:", receiverAddr.IP)
-}
+	fmt.Println("connected to receiver:", receiver.IP)
 
-// receiveFile announces this machine and waits for the sender's TCP connection.
-func receiveFile() {
-	broadcastDiscovery()
+	file, err := os.Open(path)
+	if err != nil {
+		log.Fatal("open:", err)
+	}
+	defer file.Close()
 
-	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{
-		IP:   net.IPv4zero,
-		Port: DefaultPort,
+	info, err := file.Stat()
+	if err != nil {
+		log.Fatal("stat:", err)
+	}
+
+	err = gob.NewEncoder(conn).Encode(FileMetadata{
+		Name: info.Name(),
+		Size: info.Size(),
 	})
 	if err != nil {
-		log.Fatal("receive:", err)
+		log.Fatal("metadata:", err)
+	}
+
+	_, err = io.Copy(conn, file)
+	if err != nil {
+		log.Fatal("transfer:", err)
+	}
+
+	fmt.Println("file sent:", info.Name())
+}
+
+func receiveFile(output string, port int) {
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{
+		IP:   net.IPv4zero,
+		Port: port,
+	})
+	if err != nil {
+		log.Fatal("listen:", err)
 	}
 	defer listener.Close()
+
+	// Start listening BEFORE announcing ourselves.
+	announceReceiver(port)
 
 	fmt.Println("waiting for sender...")
 
 	conn, err := listener.AcceptTCP()
 	if err != nil {
-		log.Fatal("receive:", err)
+		log.Fatal("accept:", err)
 	}
 	defer conn.Close()
 
 	fmt.Println("sender connected:", conn.RemoteAddr())
+
+	var metadata FileMetadata
+
+	err = gob.NewDecoder(conn).Decode(&metadata)
+	if err != nil {
+		log.Fatal("metadata:", err)
+	}
+
+	fmt.Println("file:", metadata.Name)
+	fmt.Println("size:", metadata.Size)
+
+	// If no output filename was supplied, use the original filename.
+	if output == "" {
+		output = metadata.Name
+	}
+
+	file, err := os.Create(output)
+	if err != nil {
+		log.Fatal("create:", err)
+	}
+	defer file.Close()
+
+	_, err = io.CopyN(file, conn, metadata.Size)
+	if err != nil {
+		log.Fatal("transfer:", err)
+	}
+
+	fmt.Println("file received:", output)
 }
 
 func main() {
@@ -108,26 +177,51 @@ func main() {
 		return
 	}
 
-	command := os.Args[1]
+	switch os.Args[1] {
 
-	switch command {
 	case "send":
 		send := flag.NewFlagSet("send", flag.ExitOnError)
-		port := send.Int("port", DefaultPort, "sender's port")
+
+		ip := send.String("ip", "", "receiver IP")
+		port := send.Int("port", DefaultPort, "receiver port")
+
 		send.Parse(os.Args[2:])
 
-		fmt.Println("port:", *port)
-		sendFile()
+		args := send.Args()
+
+		if len(args) != 1 {
+			log.Fatal("usage: transferthing send <file> [-ip IP] [-port PORT]")
+		}
+
+		file := args[0]
+
+		path, err := filepath.Abs(file)
+		if err != nil {
+			log.Fatal("path:", err)
+		}
+
+		sendFile(path, *ip, *port)
 
 	case "recv":
 		recv := flag.NewFlagSet("recv", flag.ExitOnError)
-		port := recv.Int("port", DefaultPort, "receiver's port")
+
+		file := recv.String(
+			"file",
+			"",
+			"output filename",
+		)
+
+		port := recv.Int(
+			"port",
+			DefaultPort,
+			"TCP/UDP port",
+		)
+
 		recv.Parse(os.Args[2:])
 
-		fmt.Println("port:", *port)
-		receiveFile()
+		receiveFile(*file, *port)
 
 	default:
-		fmt.Println("unknown command:", command)
+		fmt.Println("unknown command:", os.Args[1])
 	}
 }
