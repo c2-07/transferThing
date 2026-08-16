@@ -117,7 +117,12 @@ func sendFiles(paths []string, ip string, port int) error {
 	log.Info("connected to receiver", "ip", receiver.IP)
 	log.Info("using local interface", "addr", conn.LocalAddr())
 
-	if err := gob.NewEncoder(conn).Encode(TransferHeader{Count: len(paths)}); err != nil {
+	// Bug fix #1/#2: reuse a single gob encoder for the entire session.
+	// Creating a fresh encoder per-call re-sends gob type descriptors every
+	// time, bloating the wire and risking decoder mismatch on the other end.
+	enc := gob.NewEncoder(conn)
+
+	if err := enc.Encode(TransferHeader{Count: len(paths)}); err != nil {
 		return fmt.Errorf("encode header: %w", err)
 	}
 
@@ -130,11 +135,11 @@ func sendFiles(paths []string, ip string, port int) error {
 		log.Info("sending", "progress", fmt.Sprintf("%d/%d", i+1, len(paths)), "name", info.Name())
 
 		if info.IsDir() {
-			if err := sendFolder(conn, path, info); err != nil {
+			if err := sendFolder(enc, conn, path, info); err != nil {
 				return err
 			}
 		} else {
-			if err := sendSingleFile(conn, path, info); err != nil {
+			if err := sendSingleFile(enc, conn, path, info); err != nil {
 				return err
 			}
 		}
@@ -166,23 +171,43 @@ func newBar(total int64, desc string) *progressbar.ProgressBar {
 	)
 }
 
-func sendSingleFile(conn net.Conn, path string, info os.FileInfo) error {
+// finishBar ensures the completion newline is always printed, even for
+// zero-byte transfers where bar.Add is never called and OnCompletion never fires.
+func finishBar(bar *progressbar.ProgressBar) {
+	_ = bar.Finish()
+	fmt.Fprint(os.Stderr, "\n")
+}
+
+func sendSingleFile(enc *gob.Encoder, conn net.Conn, path string, info os.FileInfo) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open %q: %w", path, err)
 	}
 	defer file.Close()
 
-	if err := gob.NewEncoder(conn).Encode(FileMetadata{
+	// Bug fix #3: stat the already-open file descriptor instead of re-using the
+	// pre-open os.FileInfo. The file could have changed size between the earlier
+	// os.Stat call and now; using the fd-based stat ensures WireSize matches
+	// what io.Copy will actually read, preventing the receiver's io.CopyN from
+	// either starving (file shrank) or bleeding into the next file's metadata
+	// (file grew).
+	finfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat open file %q: %w", path, err)
+	}
+	size := finfo.Size()
+
+	if err := enc.Encode(FileMetadata{
 		Name:     info.Name(),
-		Size:     info.Size(),
-		WireSize: info.Size(),
+		Size:     size,
+		WireSize: size,
 		IsDir:    false,
 	}); err != nil {
 		return fmt.Errorf("encode metadata: %w", err)
 	}
 
-	bar := newBar(info.Size(), "sending")
+	bar := newBar(size, "sending")
+	defer finishBar(bar) // Bug fix #9: always emit the completion newline
 
 	if _, err := io.Copy(io.MultiWriter(conn, bar), file); err != nil {
 		return fmt.Errorf("transfer %q: %w", info.Name(), err)
@@ -206,8 +231,12 @@ func dirSize(root string) (int64, error) {
 	return total, err
 }
 
-// zipDir walks srcDir and writes a zip archive into w.
-func zipDir(w io.Writer, srcDir string) error {
+// zipDirWithProgress walks srcDir and writes a zip archive into w, advancing
+// bar by the number of uncompressed (input) bytes read from each file.
+// Tracking input bytes — not compressed output — prevents the bar from
+// overflowing when already-compressed files (images, videos, etc.) produce
+// zip output that is larger than the raw source.
+func zipDirWithProgress(w io.Writer, srcDir string, bar io.Writer) error {
 	zw := zip.NewWriter(w)
 
 	// filepath.Dir preserves the top-level folder name as an entry inside the zip
@@ -226,23 +255,41 @@ func zipDir(w io.Writer, srcDir string) error {
 		rel = filepath.ToSlash(rel) // zip spec requires forward slashes
 
 		if info.IsDir() {
-			_, err = zw.Create(rel + "/") // trailing slash marks a directory entry
+			hdr := &zip.FileHeader{
+				Name:   rel + "/", // trailing slash marks a directory entry
+				Method: zip.Store,
+			}
+			hdr.SetModTime(info.ModTime())
+			_, err = zw.CreateHeader(hdr)
 			return err
 		}
 
-		fw, err := zw.Create(rel)
+		hdr := &zip.FileHeader{
+			Name:               rel,
+			Method:             zip.Deflate,
+			UncompressedSize64: uint64(info.Size()),
+		}
+		hdr.SetModTime(info.ModTime())
+		fw, err := zw.CreateHeader(hdr)
 		if err != nil {
 			return err
 		}
 
+		// Bug fix #5: open, copy, and close each file explicitly instead of
+		// using defer inside the Walk closure. defer in a closure only runs when
+		// the enclosing *function* returns (i.e. after the entire Walk), so every
+		// file descriptor stays open until the whole directory has been zipped.
+		// For large directories this exhausts the OS fd limit.
 		f, err := os.Open(path)
 		if err != nil {
 			return err
 		}
-		defer f.Close()
 
-		_, err = io.Copy(fw, f)
-		return err
+		// Copy through the progress bar on the READ side so we count input
+		// bytes, not potentially-larger compressed output bytes.
+		_, copyErr := io.Copy(fw, io.TeeReader(f, bar))
+		f.Close() // always close immediately, regardless of copy error
+		return copyErr
 	})
 	if err != nil {
 		return err
@@ -253,7 +300,7 @@ func zipDir(w io.Writer, srcDir string) error {
 
 // sendFolder zips the directory into a temp file (to learn the compressed size),
 // sends metadata with the exact wire size, then streams the zip.
-func sendFolder(conn net.Conn, path string, info os.FileInfo) error {
+func sendFolder(enc *gob.Encoder, conn net.Conn, path string, info os.FileInfo) error {
 	uncompressedSize, err := dirSize(path)
 	if err != nil {
 		return fmt.Errorf("compute dir size: %w", err)
@@ -273,8 +320,9 @@ func sendFolder(conn net.Conn, path string, info os.FileInfo) error {
 		os.Remove(tmpName)
 	}()
 
-	bar := newBar(uncompressedSize, "compressing")
-	if err := zipDir(io.MultiWriter(tmp, bar), path); err != nil {
+	compressBar := newBar(uncompressedSize, "compressing")
+	defer finishBar(compressBar) // Bug fix #9: always emit completion newline
+	if err := zipDirWithProgress(tmp, path, compressBar); err != nil {
 		return fmt.Errorf("zip %q: %w", info.Name(), err)
 	}
 
@@ -286,7 +334,7 @@ func sendFolder(conn net.Conn, path string, info os.FileInfo) error {
 		return fmt.Errorf("rewind send temp file: %w", err)
 	}
 
-	if err := gob.NewEncoder(conn).Encode(FileMetadata{
+	if err := enc.Encode(FileMetadata{
 		Name:     info.Name(),
 		Size:     uncompressedSize,
 		WireSize: compressedSize,
@@ -296,6 +344,7 @@ func sendFolder(conn net.Conn, path string, info os.FileInfo) error {
 	}
 
 	sendBar := newBar(compressedSize, "sending")
+	defer finishBar(sendBar) // Bug fix #9
 	if _, err := io.Copy(io.MultiWriter(conn, sendBar), tmp); err != nil {
 		return fmt.Errorf("stream zip %q: %w", info.Name(), err)
 	}
@@ -346,8 +395,14 @@ func receiveFiles(output, ip string, port int) error {
 	// across the entire session so those bytes aren't lost between files.
 	bufReader := bufio.NewReader(conn)
 
+	// Bug fix #1/#2: reuse a single gob decoder for the entire session.
+	// Each gob.NewDecoder wraps the reader in its own internal buffer, so
+	// creating a new decoder per message silently discards any bytes that the
+	// previous decoder read ahead. A single shared decoder avoids this.
+	dec := gob.NewDecoder(bufReader)
+
 	var header TransferHeader
-	if err := gob.NewDecoder(bufReader).Decode(&header); err != nil {
+	if err := dec.Decode(&header); err != nil {
 		return fmt.Errorf("decode header: %w", err)
 	}
 
@@ -355,7 +410,7 @@ func receiveFiles(output, ip string, port int) error {
 
 	for i := 0; i < header.Count; i++ {
 		var metadata FileMetadata
-		if err := gob.NewDecoder(bufReader).Decode(&metadata); err != nil {
+		if err := dec.Decode(&metadata); err != nil {
 			return fmt.Errorf("decode metadata [%d/%d]: %w", i+1, header.Count, err)
 		}
 
@@ -366,6 +421,14 @@ func receiveFiles(output, ip string, port int) error {
 			"isDir", metadata.IsDir,
 		)
 
+		// Bug fix #6: sanitize the metadata.Name from the wire before using it
+		// as a path component. A malicious sender could set Name to "../evil"
+		// to write outside the intended destination directory.
+		safeName := filepath.Base(metadata.Name)
+		if safeName == "." || safeName == ".." || safeName == "" {
+			return fmt.Errorf("received unsafe file name %q", metadata.Name)
+		}
+
 		// Determine where to write this item:
 		//   - single file transfer + -file flag → use flag value as the exact output path
 		//   - multi-file transfer + -file flag  → treat flag as a base directory
@@ -375,9 +438,9 @@ func receiveFiles(output, ip string, port int) error {
 		case output != "" && header.Count == 1:
 			outPath = output
 		case output != "":
-			outPath = filepath.Join(output, metadata.Name)
+			outPath = filepath.Join(output, safeName)
 		default:
-			outPath = metadata.Name
+			outPath = safeName
 		}
 
 		if metadata.IsDir {
@@ -405,6 +468,7 @@ func receiveSingleFile(r io.Reader, output string, metadata FileMetadata) error 
 	defer file.Close()
 
 	bar := newBar(metadata.WireSize, "receiving")
+	defer finishBar(bar) // Bug fix #9
 
 	if _, err := io.CopyN(io.MultiWriter(file, bar), r, metadata.WireSize); err != nil {
 		return fmt.Errorf("receive %q: %w", metadata.Name, err)
@@ -418,7 +482,16 @@ func receiveSingleFile(r io.Reader, output string, metadata FileMetadata) error 
 // would escape the destination directory without this check.
 func sanitizePath(baseDir, entryName string) (string, error) {
 	dest := filepath.Join(baseDir, filepath.FromSlash(entryName))
-	if !strings.HasPrefix(filepath.Clean(dest)+string(os.PathSeparator), filepath.Clean(baseDir)+string(os.PathSeparator)) {
+
+	// Bug fix #10: filepath.Clean("/") == "/" so naively appending
+	// os.PathSeparator gives "//", which never matches the cleaned dest prefix.
+	// Use a separator-terminated clean path only when baseDir is not already the root.
+	cleanBase := filepath.Clean(baseDir)
+	if !strings.HasSuffix(cleanBase, string(os.PathSeparator)) {
+		cleanBase += string(os.PathSeparator)
+	}
+
+	if !strings.HasPrefix(filepath.Clean(dest)+string(os.PathSeparator), cleanBase) {
 		return "", fmt.Errorf("zip-slip: illegal path %q escapes destination %q", entryName, baseDir)
 	}
 	return dest, nil
@@ -430,6 +503,7 @@ func receiveFolder(r io.Reader, output string, metadata FileMetadata) error {
 	}
 
 	bar := newBar(metadata.WireSize, "receiving")
+	defer finishBar(bar) // Bug fix #9
 
 	// zip.NewReader requires io.ReaderAt (i.e. seek), so we buffer to a temp file first.
 	tmp, err := os.CreateTemp("", "transferthing-*.zip")
