@@ -1,56 +1,98 @@
 # transferthing
 
-A simple, fast, and colorful command-line utility for transferring files over the local network. 
+A fast, minimal CLI for transferring files and folders over the local network.
 
-`transferthing` automatically discovers receivers on the local network using UDP broadcast, removing the need to manually type IP addresses in most cases!
+Automatically discovers the receiver on the LAN via UDP broadcast — no need to type IP addresses.  
+Supports sending **multiple files and folders in a single session**.
 
-## Installation
+## Install
 
 ```bash
-go build -o transferthing
+go build -o tt .
 ```
 
 ## Usage
 
 ```
-transferthing - A simple file transfer tool
-
-Usage:
-  transferthing <command> [arguments]
-
-Commands:
-  send    Send a file
-  recv    Receive a file
-
-Run 'transferthing <command> -h' for more details.
+transferthing send <file|folder> [more files/folders...] [-ip IP] [-port PORT]
+transferthing recv [-file OUTPUT] [-ip IP] [-port PORT]
+transferthing <file|folder> [more files/folders...]   # implicit send shortcut
 ```
 
-### Receiving a file
+### Receive
 
-On the receiving machine, simply run:
+Start the receiver first. It announces itself on the network and waits.
 
 ```bash
-./transferthing recv
+./tt recv
 ```
 
-Options:
-- `-file string`: specify an output filename (defaults to the original filename)
-- `-port int`: specify a custom TCP/UDP port (default 4242)
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-file` | original name | Output path. For a single file: the filename. For multiple files: the base directory. |
+| `-ip` | broadcast | Sender's IP to accept from (skips UDP discovery). |
+| `-port` | `4242` | TCP/UDP port. |
 
-### Sending a file
-
-On the sending machine, run:
+### Send
 
 ```bash
-./transferthing send path/to/your/file.txt
+# Single file
+./tt send photo.jpg
+
+# Multiple files and a folder in one go
+./tt send report.pdf notes/ screenshot.png
+
+# Implicit shortcut (no subcommand needed)
+./tt report.pdf notes/ screenshot.png
+
+# Skip auto-discovery and send to a known IP
+./tt send data.zip -ip 192.168.1.42
 ```
 
-Options:
-- `-ip string`: bypass discovery and send to a specific IP address
-- `-port int`: specify a custom receiver port (default 4242)
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-ip` | auto-discover | Receiver's IP (bypasses UDP broadcast). |
+| `-port` | `4242` | TCP/UDP port. |
+
+## How it works
+
+```
+Receiver                           Sender
+--------                           ------
+ListenTCP(:4242)
+SendUDP(broadcast, "TRANSFERTHING_DISCOVERY")
+                                   RecvUDP → got receiver IP
+                                   DialTCP(receiver:4242)
+                                   Encode TransferHeader{Count: N}
+                                   for each path:
+                                     Encode FileMetadata{Name, Size, WireSize, IsDir}
+                                     stream bytes (WireSize)
+Decode header → loop N times
+  Decode FileMetadata
+  io.CopyN(WireSize bytes)
+  if folder: unzip to disk
+```
+
+**Folders** are zipped on the sender before transfer so `WireSize` (compressed) is known upfront.  
+The receiver uses `io.CopyN(WireSize)` per item — this keeps file boundaries intact across a multi-file session.
+
+## Security
+
+- **Zip-slip protection**: every zip entry path is validated to remain inside the output directory before extraction.
+- **IP validation**: `net.ParseIP` is checked for `nil` on both sides before use.
 
 ## Features
-- **Auto-Discovery**: No need to manually type IP addresses; senders find receivers automatically on the local network.
-- **Progress Bar**: See transfer speed, time remaining, and bytes transferred.
-- **Colorful Logging**: Beautiful structured logs.
-- **Simple**: Written in Go with minimal dependencies.
+
+- **Multi-file / folder transfers** — send any mix of files and folders in one command
+- **Auto-discovery** — UDP broadcast finds the receiver automatically on the LAN
+- **Compact progress bar** — 22-char Unicode block bar (`█▌░`) with speed and ETA, aligned across files
+- **Local interface logging** — both sides log which network interface the OS chose
+- **Structured logs** — via [charmbracelet/log](https://github.com/charmbracelet/log)
+- **Proper error handling** — all errors propagated with context, no panics
+
+## Dependencies
+
+| Package | Purpose |
+|---------|---------|
+| [`charmbracelet/log`](https://github.com/charmbracelet/log) | Structured, coloured logging |
+| [`schollz/progressbar`](https://github.com/schollz/progressbar) | Terminal progress bar |
